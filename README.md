@@ -50,7 +50,7 @@ data/
     └── test_raw_frames/
 ```
 
-Dataset roots are defined at the top of each config in `configs/`. The provided configs already contain entries for CAP, DADA, D²-City, and Nexar; enable or disable datasets there as needed.
+Dataset roots are defined at the top of each config in `configs/`. The provided configs already contain entries for CAP, DADA, D²-City, and Nexar; enable or disable datasets there as needed. The code for processing the Nexar dataset and the documentation are available at this link: https://wwbfj.lanzouw.com/i5CsY3qes66j 
 
 ## Quick Start
 
