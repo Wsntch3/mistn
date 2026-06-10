@@ -117,11 +117,13 @@ Checkpoints and logs are saved to `work_dirs/<config_name>/`. The default best-c
 ## Citation
 
 ```bibtex
-@inproceedings{zou2026riskprop,
-  title={RiskProp: Collision-Anchored Self-Supervised Risk Propagation for Early Accident Anticipation},
-  author={Zou, Yiyang and Zhao, Tianhao and Xiao, Peilun and Jin, Hongyu and Qi, Longyu and Li, Yuxuan and Liang, Liyin and Qian, Yifeng and Lai, Chunbo and Lin, Yutian and others},
-  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
-  year={2026}
+@InProceedings{Zou_2026_CVPR,
+    author    = {Zou, Yiyang and Zhao, Tianhao and Xiao, Peilun and Jin, Hongyu and Qi, Longyu and Li, Yuxuan and Liang, Liyin and Qian, Yifeng and Lai, Chunbo and Lin, Yutian and Li, Zhihui and Wu, Yu},
+    title     = {RiskProp: Collision-Anchored Self-Supervised Risk Propagation For Early Accident Anticipation},
+    booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
+    month     = {June},
+    year      = {2026},
+    pages     = {2768-2777}
 }
 ```
 
