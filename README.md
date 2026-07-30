@@ -1,7 +1,5 @@
 # RiskProp: Collision-Anchored Self-Supervised Risk Propagation for Early Accident Anticipation
 
-<h3 align="center">CVPR 2026 Highlight</h3>
-
 ## Overview
 RiskProp is a traffic accident anticipation framework for dashcam videos. It predicts collision risk in advance and introduces collision-anchored self-supervised temporal constraints to enforce progressively increasing risk toward the collision point. Instead of relying on dense frame-level risk annotations, RiskProp regularizes the temporal evolution of risk scores using collision supervision, leading to smoother and more collision-consistent anticipation.
 
