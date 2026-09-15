@@ -1,118 +1,288 @@
-# RiskProp: Collision-Anchored Self-Supervised Risk Propagation for Early Accident Anticipation
+# MI-STN: Motion-Interaction Spatio-Temporal Network for Traffic Accident Anticipation
 
 ## Overview
-RiskProp is a traffic accident anticipation framework for dashcam videos. It predicts collision risk in advance and introduces collision-anchored self-supervised temporal constraints to enforce progressively increasing risk toward the collision point. Instead of relying on dense frame-level risk annotations, RiskProp regularizes the temporal evolution of risk scores using collision supervision, leading to smoother and more collision-consistent anticipation.
 
-Built on [MMAction2](https://github.com/open-mmlab/mmaction2), this repository includes training and evaluation code for early accident anticipation on CAP, DADA, D²-City, and Nexar-style datasets.
+This repository contains the additional implementation developed for **MI-STN (Motion-Interaction Spatio-Temporal Network)**, a research model for early traffic accident anticipation.
 
-<p align="center">
-  <img src="resources/visual.gif" width="85%" alt="RiskProp demo">
-</p>
+MI-STN is developed as an extension for experimental comparison with **RiskProp**, which is used as the baseline framework. The original RiskProp repository is maintained by its original authors and can be accessed here:
+
+**Original RiskProp repository:**
+https://github.com/xingyueye5/RiskProp
+
+This repository is **not the original RiskProp repository**. It contains additional code and configuration required to implement and evaluate MI-STN while reusing the RiskProp framework and environment.
+
+The proposed MI-STN models traffic risk by jointly considering:
+
+* individual object motion,
+* dynamic interactions between surrounding objects,
+* temporal dependencies, and
+* multi-horizon accident risk prediction.
+
+The overall architecture is:
+
+```text
+Motion Features
+      │
+      ▼
+ Motion Module
+      │
+      ▼
+Motion Embedding ─────────────┐
+                             │
+Interaction Features          │
+      │                      ▼
+      ▼                  Fusion
+Interaction Module             │
+      │                      ▼
+      ▼                     GRU
+Interaction Embedding          │
+                             ▼
+                       Risk Prediction
+```
+
+## Relationship to RiskProp
+
+RiskProp is used as the **baseline model** for this research.
+
+The original RiskProp framework provides the training, evaluation, dataset handling, and accident anticipation infrastructure. This repository adds the MI-STN-specific implementation without changing the original research repository.
+
+```text
+Original RiskProp
+https://github.com/xingyueye5/RiskProp
+        │
+        │ baseline framework
+        ▼
+   RiskProp environment
+        │
+        ├── Original RiskProp code
+        │
+        └── Additional MI-STN implementation
+                    │
+                    ├── Motion Module
+                    ├── Interaction Module
+                    ├── Fusion Head
+                    └── MI-STN Recognizer
+```
+
+For reproducibility, the original RiskProp repository should be consulted for its installation requirements, dataset preparation, and baseline training procedures.
+
+## Repository Structure
+
+The additional implementation in this repository is organized as follows:
+
+```text
+mistn/
+├── configs/
+│   ├── predict_anomaly_frame.py
+│   └── mi_stn.py
+│
+└── mi_stn/
+    ├── __init__.py
+    ├── motion_module.py
+    ├── interaction_module.py
+    ├── fusion_head.py
+    └── mi_stn_recognizer.py
+```
+
+The `mi_stn/` directory contains the implementation of the proposed model, while `configs/mi_stn.py` contains the configuration used to run MI-STN experiments.
+
+The original RiskProp source code remains part of the baseline environment when this repository is used alongside RiskProp.
+
+## MI-STN Components
+
+### Motion Module
+
+The Motion Module processes object-level motion features extracted from tracked trajectories.
+
+The current motion representation contains:
+
+```text
+x
+y
+vx
+vy
+speed
+ax
+ay
+accel
+direction
+```
+
+These features are transformed into a latent motion representation before being passed to the interaction modeling stage.
+
+### Interaction Module
+
+The Interaction Module models relationships between surrounding traffic objects.
+
+The interaction representation is derived from object trajectories and includes information such as:
+
+```text
+distance
+dx
+dy
+relative_vx
+relative_vy
+relative_speed
+closing_speed
+direction_difference
+interaction_strength
+```
+
+The purpose of this module is to capture dynamic interactions that may indicate an increasing accident risk.
+
+### Fusion and Temporal Modeling
+
+Motion and interaction representations are combined through the Fusion Head.
+
+The fused representation is then processed using a GRU to model temporal dependencies before producing accident-risk predictions.
+
+### Risk Prediction
+
+MI-STN is designed to predict accident risk at multiple temporal horizons before the accident.
+
+The exact temporal horizon configuration follows the evaluation setting used for comparison with the RiskProp baseline.
+
+## Dataset
+
+The experiments use the **DADA-2000** traffic accident anticipation dataset.
+
+DADA-2000 provides dashcam videos and accident-related annotations. Object trajectories are generated separately using an object detection and tracking pipeline.
+
+The preprocessing pipeline used in this research is:
+
+```text
+DADA-2000
+    │
+    ▼
+Object Detection
+    │
+    ▼
+ByteTrack
+    │
+    ▼
+Object Trajectories
+    │
+    ├───────────────┐
+    ▼               ▼
+Motion Features   Interaction Features
+    │               │
+    └───────┬───────┘
+            ▼
+          MI-STN
+```
+
+The extracted features are stored separately from the model source code and are not included in this repository because of their large storage requirements.
 
 ## Installation
 
-```bash
-conda create -n riskprop python=3.8.5 -y
-conda activate riskprop
+MI-STN is intended to run within the **RiskProp environment**.
 
-pip install -r requirements.txt
-pip install torch torchvision
-pip install -U openmim
-mim install mmengine==0.10.7
-mim install mmcv==2.2.0
-mim install mmaction2==1.2.0
-pip install -v -e .
+First, clone the original RiskProp repository:
+
+```bash
+git clone https://github.com/xingyueye5/RiskProp.git
+cd RiskProp
 ```
 
-## Data Preparation
+Install the dependencies according to the original RiskProp repository.
 
-Place datasets under `data/` with a layout similar to:
+Then copy or clone the MI-STN implementation into the RiskProp environment.
+
+The MI-STN configuration can then be used with:
+
+```bash
+tools/train.py configs/mi_stn.py
+```
+
+> The exact installation procedure and dependency versions should follow the original RiskProp repository.
+
+## Training
+
+The RiskProp baseline can be trained using its original configuration and training procedure.
+
+MI-STN uses the additional configuration:
 
 ```text
-data/
-├── MM-AU/
-│   ├── CAP-DATA/
-│   │   ├── cap_text_annotations.xls
-│   │   ├── 1-10/
-│   │   ├── 11/
-│   │   ├── 12-42/
-│   │   └── ...
-│   └── DADA-DATA/
-│       ├── dada_text_annotations.xlsx
-│       └── ...
-└── nexar-collision-prediction/
-    ├── annotations.csv
-    ├── train/
-    ├── test/
-    ├── train_raw_frames/
-    └── test_raw_frames/
+configs/mi_stn.py
 ```
 
-Dataset roots are defined at the top of each config in `configs/`. The provided configs already contain entries for CAP, DADA, D²-City, and Nexar; enable or disable datasets there as needed. The code for processing the Nexar dataset and the documentation are available at this link: https://wwbfj.lanzouw.com/i5CsY3qes66j 
+The model is specified as:
 
-## Quick Start
-
-### Option 1: Use the wrapper scripts
-
-The repository provides two lightweight wrappers:
-
-- `dist_train.sh`: copies the selected config and `taa/` source into `codes/<name>/<timestamp>/`, then launches distributed training.
-- `dist_test.sh`: runs distributed evaluation for the selected config and checkpoint.
-
-Before using them, edit the `name`, GPU list, and checkpoint path inside the scripts if needed.
-
-```bash
-bash dist_train.sh
-bash dist_test.sh
+```python
+model = dict(
+    type="MISTNRecognizer",
+    ...
+)
 ```
 
-### Option 2: Launch training directly
-### Training
-```bash
-# Main snippet-level anticipation model
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 PORT=29500 \
-tools/dist_train.sh configs/predict_anomaly_snippet.py 8
+The custom model is automatically registered through:
 
-# Frame-level anticipation model
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 PORT=29500 \
-tools/dist_train.sh configs/predict_anomaly_frame.py 8
+```python
+custom_imports = dict(
+    imports="mi_stn",
+    allow_failed_imports=False,
+)
 ```
 
-### Evalution
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 PORT=29501 \
-tools/dist_test.sh configs/predict_anomaly_snippet.py \
-work_dirs/predict_anomaly_snippet/<checkpoint>.pth 8
+## Evaluation
+
+MI-STN is evaluated using the same accident anticipation evaluation framework as the RiskProp baseline where applicable.
+
+The main evaluation metrics include:
+
+| Metric     | Description                        |
+| ---------- | ---------------------------------- |
+| `mAUC@`    | Mean partial AUC with FPR ≤ 0.1    |
+| `mAUC`     | Mean full-curve AUC                |
+| `mAP`      | Mean Average Precision             |
+| `mTTA@0.1` | Mean Time-To-Accident at FPR ≤ 0.1 |
+
+The same dataset split and evaluation conditions should be used when comparing MI-STN with RiskProp to ensure a fair comparison.
+
+## Baseline Comparison
+
+The main experimental comparison is:
+
+```text
+RiskProp
+   │
+   │ Baseline
+   ▼
+DADA-2000
+   │
+   ├───────────────┐
+   │               │
+   ▼               ▼
+RiskProp         MI-STN
+Baseline        Proposed Model
+   │               │
+   └───────┬───────┘
+           ▼
+      Same Evaluation
+           │
+           ▼
+       Comparison
 ```
 
-To export predictions for offline analysis:
+The comparison focuses on whether explicitly modeling object motion and dynamic inter-object interactions improves early accident anticipation performance.
 
-```bash
-tools/dist_test.sh configs/predict_anomaly_snippet.py <checkpoint>.pth 8 \
-  --dump outputs/predictions.pkl
-```
+## Research Status
 
-Checkpoints and logs are saved to `work_dirs/<config_name>/`. The default best-checkpoint criterion is `mAUC@`.
+This repository is intended for research and experimental purposes.
 
-## Config Overview
+The current implementation is under development and may be modified as the MI-STN architecture, preprocessing pipeline, and experimental configuration are refined.
 
-| Config | Task | Backbone | Temporal Setup |
-| --- | --- | --- | --- |
-| `predict_anomaly_snippet.py` | Accident anticipation | SlowOnly-R50 | `5` frames x `30` clips |
-| `predict_anomaly_frame.py` | Accident anticipation | ResNet-50 + RNN | `1` frame x `30` clips | 
-| `predict_occurrence_snippet.py` | Occurrence prediction | SlowOnly-R50 + decoder | `5` frames x `30` clips | 
-| `predict_occurrence_frame.py` | Occurrence prediction | ResNet-50 + RNN + decoder | `1` frame x `30` clips | 
+## Acknowledgement
 
-## Evaluation Metrics
+This work uses the **RiskProp** framework as the baseline for experimental comparison.
 
-| Metric | Description |
-| --- | --- |
-| `mAUC@` | Mean partial AUC with `FPR <= 0.1` at `0.5s`, `1.0s`, and `1.5s` before the accident |
-| `mAUC` | Mean full-curve AUC at `0.5s`, `1.0s`, and `1.5s` |
-| `mAP` | Mean Average Precision at `0.5s`, `1.0s`, and `1.5s` |
-| `mTTA@0.1` | Mean Time-To-Accident at `FPR <= 0.1` |
+Please refer to the original RiskProp repository for the original implementation, documentation, and citation:
+
+https://github.com/xingyueye5/RiskProp
 
 ## Citation
+
+If you use the original RiskProp framework, please cite the original authors:
 
 ```bibtex
 @InProceedings{Zou_2026_CVPR,
@@ -127,4 +297,11 @@ Checkpoints and logs are saved to `work_dirs/<config_name>/`. The default best-c
 
 ## License
 
-This project is released under the [Apache 2.0 License](LICENSE).
+The original RiskProp project is released under the Apache 2.0 License.
+
+Please refer to the original repository for the complete license and attribution information:
+
+https://github.com/xingyueye5/RiskProp
+
+```
+```
