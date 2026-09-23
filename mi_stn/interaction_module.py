@@ -8,25 +8,23 @@ class InteractionModule(nn.Module):
     Dynamic Inter-Object Interaction Module untuk MI-STN.
 
     Input:
-        object_features:
-            [B, T, N, D]
+        interaction_features:
+            [B, T, N, K, F]
 
-        B = batch size
-        T = timestep
-        N = jumlah objek
-        D = dimensi feature objek
+        interaction_mask:
+            [B, T, N, K]
 
     Output:
-        interaction_features:
+        interaction_embedding:
             [B, T, N, D_out]
     """
 
     def __init__(
         self,
-        input_dim=64,
+        input_dim=9,
         hidden_dim=64,
         output_dim=64,
-        dropout=0.1
+        dropout=0.1,
     ):
         super().__init__()
 
@@ -34,167 +32,204 @@ class InteractionModule(nn.Module):
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
 
-        # Transformasi feature objek
+        # --------------------------------------------------
+        # 1. Project raw pairwise interaction features
+        # --------------------------------------------------
+
         self.feature_projection = nn.Linear(
             input_dim,
-            hidden_dim
+            hidden_dim,
         )
 
-        # Attention layer
+        # --------------------------------------------------
+        # 2. Attention over neighbors
+        # --------------------------------------------------
+
         self.query = nn.Linear(
             hidden_dim,
             hidden_dim,
-            bias=False
+            bias=False,
         )
 
         self.key = nn.Linear(
             hidden_dim,
             hidden_dim,
-            bias=False
+            bias=False,
         )
 
         self.value = nn.Linear(
             hidden_dim,
             output_dim,
-            bias=False
+            bias=False,
         )
 
-        # Output projection
+        # --------------------------------------------------
+        # 3. Output projection
+        # --------------------------------------------------
+
         self.output_projection = nn.Linear(
             output_dim,
-            output_dim
+            output_dim,
         )
 
         self.norm = nn.LayerNorm(output_dim)
-
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, object_features, object_mask=None):
+    def forward(
+        self,
+        interaction_features,
+        interaction_mask=None,
+    ):
         """
         Args:
-            object_features:
-                Tensor [B, T, N, D]
+            interaction_features:
+                [B, T, N, K, 9]
 
-            object_mask:
-                Optional tensor [B, T, N]
-                True  = objek valid
-                False = padding
+            interaction_mask:
+                [B, T, N, K]
 
         Returns:
-            interaction_features:
-                Tensor [B, T, N, output_dim]
+            interaction_embedding:
+                [B, T, N, 64]
         """
 
-        if object_features.dim() != 4:
+        if interaction_features.dim() != 5:
             raise ValueError(
-                "object_features harus memiliki bentuk "
-                "[B, T, N, D], "
-                f"tetapi mendapatkan {object_features.shape}"
+                "interaction_features harus memiliki bentuk "
+                "[B, T, N, K, F], "
+                f"tetapi mendapatkan {interaction_features.shape}"
             )
 
-        B, T, N, D = object_features.shape
+        B, T, N, K, F_dim = interaction_features.shape
 
-        if D != self.input_dim:
+        if F_dim != self.input_dim:
             raise ValueError(
-                f"Dimensi feature tidak sesuai. "
+                f"Dimensi interaction feature tidak sesuai. "
                 f"Diharapkan {self.input_dim}, "
-                f"tetapi mendapatkan {D}"
+                f"tetapi mendapatkan {F_dim}"
             )
 
         # --------------------------------------------------
-        # 1. Project object features
+        # 1. Feature projection
         # --------------------------------------------------
 
-        x = self.feature_projection(object_features)
+        x = self.feature_projection(
+            interaction_features
+        )
 
-        # x:
-        # [B, T, N, hidden_dim]
+        # [B, T, N, K, hidden_dim]
 
         # --------------------------------------------------
         # 2. Query, Key, Value
         # --------------------------------------------------
 
         q = self.query(x)
+
         k = self.key(x)
+
         v = self.value(x)
 
         # --------------------------------------------------
-        # 3. Pairwise attention antar objek
+        # 3. Query aggregation
         # --------------------------------------------------
 
-        # q:
-        # [B, T, N, D]
+        # Gunakan mean query dari seluruh neighbor
+        # sebagai representasi sumber object.
 
-        # k:
-        # [B, T, N, D]
+        q_global = q.mean(dim=3, keepdim=True)
 
-        # attention_scores:
-        # [B, T, N, N]
+        # [B, T, N, 1, hidden_dim]
 
-        attention_scores = torch.matmul(
-            q,
-            k.transpose(-2, -1)
+        # --------------------------------------------------
+        # 4. Attention score antar neighbor
+        # --------------------------------------------------
+
+        scores = torch.sum(
+            q_global * k,
+            dim=-1,
         )
 
-        attention_scores = attention_scores / (
+        scores = scores / (
             self.hidden_dim ** 0.5
         )
 
+        # [B, T, N, K]
+
         # --------------------------------------------------
-        # 4. Mask objek padding jika tersedia
+        # 5. Mask padding neighbors
         # --------------------------------------------------
 
-        if object_mask is not None:
+        if interaction_mask is not None:
 
-            if object_mask.shape != (B, T, N):
+            if interaction_mask.shape != (
+                B,
+                T,
+                N,
+                K,
+            ):
                 raise ValueError(
-                    "object_mask harus memiliki bentuk "
-                    f"[B, T, N], tetapi mendapatkan "
-                    f"{object_mask.shape}"
+                    "interaction_mask harus memiliki bentuk "
+                    f"[B,T,N,K], tetapi mendapatkan "
+                    f"{interaction_mask.shape}"
                 )
 
-            # Key mask
-            key_mask = object_mask.unsqueeze(-2)
+            mask = interaction_mask.bool()
 
-            attention_scores = attention_scores.masked_fill(
-                ~key_mask,
-                float("-inf")
+            scores = scores.masked_fill(
+                ~mask,
+                torch.finfo(scores.dtype).min,
             )
 
+        else:
+            mask = None
+
         # --------------------------------------------------
-        # 5. Softmax attention
+        # 6. Attention weights
         # --------------------------------------------------
 
         attention_weights = F.softmax(
-            attention_scores,
-            dim=-1
+            scores,
+            dim=-1,
         )
+
+        if mask is not None:
+            attention_weights = (
+                attention_weights * mask.to(
+                    attention_weights.dtype
+                )
+            )
+
+            denominator = attention_weights.sum(
+                dim=-1,
+                keepdim=True,
+            ).clamp_min(1e-6)
+
+            attention_weights = (
+                attention_weights / denominator
+            )
 
         attention_weights = self.dropout(
             attention_weights
         )
 
         # --------------------------------------------------
-        # 6. Aggregate informasi objek lain
+        # 7. Aggregate neighbors
         # --------------------------------------------------
 
-        interaction = torch.matmul(
-            attention_weights,
-            v
+        interaction = torch.sum(
+            attention_weights.unsqueeze(-1) * v,
+            dim=3,
         )
 
+        # [B, T, N, output_dim]
+
         # --------------------------------------------------
-        # 7. Output projection
+        # 8. Output projection
         # --------------------------------------------------
 
         interaction = self.output_projection(
             interaction
         )
-
-        # Residual connection
-        # hanya jika dimensi sama
-        if interaction.shape[-1] == object_features.shape[-1]:
-            interaction = interaction + object_features
 
         interaction = self.norm(interaction)
 
