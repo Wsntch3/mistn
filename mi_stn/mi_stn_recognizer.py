@@ -1,7 +1,9 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from mmengine.registry import MODELS
+from mmengine.model import BaseModel
+from mmaction.registry import MODELS
 
 from .motion_module import MotionModule
 from .interaction_module import InteractionModule
@@ -9,40 +11,37 @@ from .fusion_head import MISTNFusionHead
 
 
 @MODELS.register_module()
-class MISTNRecognizer(nn.Module):
+class MISTNRecognizer(BaseModel):
     """
     Motion-Interaction Spatio-Temporal Network (MI-STN).
 
-    Pipeline:
-        Motion Features
-            ↓
-        MotionModule
-            ↓
-        Motion Embedding
-            ↓
-        InteractionModule
-            ↓
-        Interaction Embedding
-            ↓
-        MISTNFusionHead
-            ↓
-        Temporal Modeling (GRU)
-            ↓
-        Risk Prediction
+    MISTN hanya menyediakan:
+        - MotionModule
+        - InteractionModule
+        - FusionHead
 
-    Input:
-        motion_features:
+    Training, validation, testing, checkpoint, metric,
+    dan hooks tetap menggunakan framework TAA / RiskProp.
+
+    Input dari MISTNDataset:
+        motion:
             [B, T, N, 9]
 
-    Output:
-        risk:
+        interaction:
+            [B, T, N, K, 9]
+
+        motion_mask:
+            [B, T, N]
+
+        neighbor_mask:
+            [B, T, N, K]
+
+        labels:
             [B, T, H]
 
-        B = batch size
-        T = temporal sequence length
-        N = number of objects
-        9 = motion features
-        H = number of temporal horizons
+    Output:
+        risk logits:
+            [B, T, H]
     """
 
     def __init__(
@@ -50,18 +49,26 @@ class MISTNRecognizer(nn.Module):
         motion_input_dim=9,
         motion_hidden_dim=64,
         motion_output_dim=64,
+
+        interaction_input_dim=9,
         interaction_hidden_dim=64,
         interaction_output_dim=64,
+
         fusion_dim=128,
         temporal_dim=128,
+
         num_horizons=3,
         dropout=0.1,
-    ):
-        super().__init__()
 
-        # --------------------------------------------------
+        init_cfg=None,
+    ):
+        super().__init__(
+            init_cfg=init_cfg
+        )
+
+        # ==================================================
         # 1. Motion Module
-        # --------------------------------------------------
+        # ==================================================
 
         self.motion_module = MotionModule(
             input_dim=motion_input_dim,
@@ -70,20 +77,20 @@ class MISTNRecognizer(nn.Module):
             dropout=dropout,
         )
 
-        # --------------------------------------------------
+        # ==================================================
         # 2. Interaction Module
-        # --------------------------------------------------
+        # ==================================================
 
         self.interaction_module = InteractionModule(
-            input_dim=motion_output_dim,
+            input_dim=interaction_input_dim,
             hidden_dim=interaction_hidden_dim,
             output_dim=interaction_output_dim,
             dropout=dropout,
         )
 
-        # --------------------------------------------------
-        # 3. Fusion + Temporal + Risk Prediction
-        # --------------------------------------------------
+        # ==================================================
+        # 3. Fusion Head
+        # ==================================================
 
         self.fusion_head = MISTNFusionHead(
             motion_dim=motion_output_dim,
@@ -94,49 +101,293 @@ class MISTNRecognizer(nn.Module):
             dropout=dropout,
         )
 
-    def forward(
+        # ==================================================
+        # Compatibility dengan TAA EpochHook
+        # ==================================================
+
+        self.cls_head = self.fusion_head
+
+        # ==================================================
+        # Configuration
+        # ==================================================
+
+        self.num_horizons = num_horizons
+
+    # ======================================================
+    # Feature Extraction
+    # ======================================================
+
+    def _extract_features(
         self,
-        motion_features,
-        object_mask=None,
+        motion,
+        interaction,
+        motion_mask=None,
+        neighbor_mask=None,
     ):
         """
-        Args:
-            motion_features:
-                Tensor [B, T, N, 9]
-
-            object_mask:
-                Optional tensor [B, T, N]
-
-        Returns:
-            risk:
-                Tensor [B, T, H]
+        Menghasilkan motion dan interaction embedding.
         """
 
         # --------------------------------------------------
-        # Motion representation
+        # Motion branch
         # --------------------------------------------------
 
         motion_embedding = self.motion_module(
-            motion_features
+            motion
         )
 
+        # [B, T, N, motion_output_dim]
+
         # --------------------------------------------------
-        # Dynamic interaction representation
+        # Interaction branch
         # --------------------------------------------------
 
         interaction_embedding = self.interaction_module(
-            motion_embedding,
-            object_mask=object_mask,
+            interaction,
+            interaction_mask=neighbor_mask,
         )
 
-        # --------------------------------------------------
-        # Fusion + temporal modeling + risk prediction
-        # --------------------------------------------------
+        # [B, T, N, interaction_output_dim]
 
-        risk = self.fusion_head(
+        return (
             motion_embedding,
             interaction_embedding,
         )
 
-        return risk
+    # ======================================================
+    # Forward Tensor
+    # ======================================================
 
+    def _forward(
+        self,
+        inputs,
+        data_samples=None,
+        **kwargs,
+    ):
+        """
+        Forward tensor untuk mode tensor.
+        """
+
+        motion = inputs["motion"]
+        interaction = inputs["interaction"]
+
+        motion_mask = inputs.get(
+            "motion_mask",
+            None,
+        )
+
+        neighbor_mask = inputs.get(
+            "neighbor_mask",
+            None,
+        )
+
+        motion_embedding, interaction_embedding = (
+            self._extract_features(
+                motion=motion,
+                interaction=interaction,
+                motion_mask=motion_mask,
+                neighbor_mask=neighbor_mask,
+            )
+        )
+
+        risk_logits = self.fusion_head(
+            motion_embedding,
+            interaction_embedding,
+        )
+
+        return risk_logits
+
+    # ======================================================
+    # Loss
+    # ======================================================
+
+    def loss(
+        self,
+        inputs,
+        data_samples=None,
+        **kwargs,
+    ):
+        """
+        Training loss.
+
+        labels:
+            [B, T, H]
+        """
+
+        labels = inputs["labels"].float()
+
+        risk_logits = self._forward(
+            inputs=inputs,
+            data_samples=data_samples,
+        )
+
+        if risk_logits.shape != labels.shape:
+            raise ValueError(
+                "Ukuran output model dan label tidak sama. "
+                f"risk_logits={risk_logits.shape}, "
+                f"labels={labels.shape}"
+            )
+
+        loss = F.binary_cross_entropy_with_logits(
+            risk_logits,
+            labels,
+        )
+
+        return {
+            "loss": loss,
+        }
+
+    # ======================================================
+    # Prediction
+    # ======================================================
+
+    def predict(
+        self,
+        inputs,
+        data_samples=None,
+        **kwargs,
+    ):
+        """
+        Menghasilkan output yang kompatibel dengan
+        taa.AnticipationMetric.
+
+        Output setiap sample berbentuk dict yang memiliki:
+
+            pred_score
+            target
+            frame_inds
+            abnormal_start_frame
+            accident_frame
+            video_id
+            dataset
+            frame_dir
+            filename_tmpl
+            type
+            is_val
+            is_test
+        """
+
+        risk_logits = self._forward(
+            inputs=inputs,
+            data_samples=data_samples,
+        )
+
+        # Probabilitas risiko
+        pred_score = torch.sigmoid(
+            risk_logits
+        )
+
+        batch_size = pred_score.shape[0]
+
+        results = []
+
+        video_ids = inputs["video_id"]
+
+        targets = inputs["target"]
+
+        abnormal_start_frames = inputs[
+            "abnormal_start_frame"
+        ]
+
+        is_val_list = inputs[
+            "is_val"
+        ]
+
+        is_test_list = inputs[
+            "is_test"
+        ]
+
+        frames = inputs[
+            "frames"
+        ]
+
+        accident_frames = inputs[
+            "accident_frame"
+        ]
+
+        for i in range(batch_size):
+
+            result = {
+                # ------------------------------------------
+                # Prediction
+                # ------------------------------------------
+
+                "pred_score": pred_score[i],
+
+                # ------------------------------------------
+                # Target
+                # ------------------------------------------
+
+                "target": bool(
+                    targets[i]
+                ),
+
+                # ------------------------------------------
+                # Temporal information
+                # ------------------------------------------
+
+                "frame_inds": frames[i].detach().cpu(),
+
+                "abnormal_start_frame": int(
+                    abnormal_start_frames[i]
+                ),
+
+                "accident_frame": int(
+                    accident_frames[i].item()
+                ),
+
+                # ------------------------------------------
+                # Identity
+                # ------------------------------------------
+
+                "video_id": video_ids[i],
+
+                "dataset": "DADA2000",
+
+                "frame_dir": video_ids[i],
+
+                "filename_tmpl": "{:04d}.png",
+
+                "type": "DADA2000",
+
+                # ------------------------------------------
+                # RiskProp metadata
+                # ------------------------------------------
+
+                "is_val": bool(
+                    is_val_list[i]
+                ),
+
+                "is_test": bool(
+                    is_test_list[i]
+                ),
+            }
+
+            results.append(
+                result
+            )
+
+        return results
+
+    # ======================================================
+    # Simple forward alias
+    # ======================================================
+
+    def forward(
+        self,
+        inputs,
+        data_samples=None,
+        mode="tensor",
+        **kwargs,
+    ):
+        """
+        Tidak perlu override BaseModel secara agresif.
+        mode diteruskan ke implementasi BaseModel.
+        """
+
+        return super().forward(
+            inputs=inputs,
+            data_samples=data_samples,
+            mode=mode,
+            **kwargs,
+        )
