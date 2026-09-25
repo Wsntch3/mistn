@@ -1,34 +1,34 @@
 import json
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
 from mmaction.registry import DATASETS
 from mmengine.registry import FUNCTIONS
+from taa.splits import dada_test
 
 
 @DATASETS.register_module()
 class MISTNDataset(Dataset):
     """
-    Dataset MI-STN yang kompatibel dengan framework TAA / RiskProp.
+    MI-STN dataset dengan pembagian video dan semantics sampling
+    yang mengikuti RiskProp/TAA.
 
-    Satu item dataset merepresentasikan satu video.
+    Prinsip utama:
+        - RiskProp menentukan video mana yang masuk train/test.
+        - MI-STN hanya menggunakan feature dari video tersebut.
+        - Satu video dapat menghasilkan:
+            target=True
+            target=False
+        - Sehingga jumlah SAMPLE tidak sama dengan jumlah VIDEO.
 
-    Setiap video diubah menjadi sequence temporal tetap:
-
-        [T, N, 9]          motion
-        [T, N, K, 9]       interaction
-
-    T = sequence_length
-    N = max_objects
-    K = max_neighbors
-
-    Output batch selanjutnya digunakan oleh MISTNRecognizer.
-    Metadata is_val / is_test dibuat mengikuti kebutuhan
-    AnticipationMetric milik TAA.
+    DADA-2000:
+        FPS             = 30
+        Sampling        = 10 Hz
+        Frame interval  = 3 frame
+        Sequence length = 30 timestep
     """
 
     def __init__(
@@ -49,10 +49,6 @@ class MISTNDataset(Dataset):
 
         self.split = split
 
-        # --------------------------------------------------
-        # Feature root
-        # --------------------------------------------------
-
         if data_root is not None:
             feature_root = data_root
 
@@ -60,32 +56,33 @@ class MISTNDataset(Dataset):
 
         if not self.feature_root.exists():
             raise FileNotFoundError(
-                f"Feature directory tidak ditemukan: "
-                f"{self.feature_root}"
+                f"Feature directory tidak ditemukan: {self.feature_root}"
             )
 
-        # --------------------------------------------------
-        # Configuration
-        # --------------------------------------------------
-
-        self.sequence_length = sequence_length
-        self.max_objects = max_objects
-        self.max_neighbors = max_neighbors
+        self.sequence_length = int(sequence_length)
+        self.max_objects = int(max_objects)
+        self.max_neighbors = int(max_neighbors)
         self.horizons = tuple(horizons)
-        self.fps = fps
+        self.fps = int(fps)
         self.stride = stride
         self.test_mode = test_mode
 
-        # --------------------------------------------------
-        # Annotation
-        # --------------------------------------------------
+        if self.fps % 10 != 0:
+            raise ValueError(
+                f"FPS {self.fps} tidak kompatibel dengan sampling TAA 10 Hz."
+            )
+
+        # DADA 30 FPS -> 10 Hz
+        self.frame_interval = self.fps // 10
+
+        # Sama dengan RiskProp
+        self.start_index = 1
 
         annotation_file = Path(annotation_file)
 
         if not annotation_file.exists():
             raise FileNotFoundError(
-                f"Annotation file tidak ditemukan: "
-                f"{annotation_file}"
+                f"Annotation file tidak ditemukan: {annotation_file}"
             )
 
         df = pd.read_excel(
@@ -98,10 +95,7 @@ class MISTNDataset(Dataset):
 
         for _, row in df.iterrows():
             try:
-                video_id = (
-                    f"{int(row[5])}_"
-                    f"{str(row[0]).zfill(3)}"
-                )
+                video_id = f"{int(row[5])}_{str(row[0]).zfill(3)}"
 
                 self.annotations[video_id] = {
                     "accident": int(row[6]),
@@ -113,155 +107,249 @@ class MISTNDataset(Dataset):
 
             except (TypeError, ValueError, IndexError):
                 continue
-
-        # --------------------------------------------------
-        # Build video samples
-        # --------------------------------------------------
-
         self.samples = []
 
         matched_videos = 0
         skipped_videos = 0
 
+        # Statistik khusus untuk debugging
+        skipped_not_in_split = 0
+        skipped_no_annotation = 0
+        skipped_no_motion = 0
+        skipped_no_interaction = 0
+        skipped_non_accident = 0
+        skipped_not_enough_frames = 0
+
         video_dirs = sorted(
             p for p in self.feature_root.iterdir()
             if p.is_dir()
         )
-
         for video_dir in video_dirs:
 
             video_id = video_dir.name
 
-            # ----------------------------------------------
-            # Annotation harus tersedia
-            # ----------------------------------------------
-
             if video_id not in self.annotations:
                 skipped_videos += 1
+                skipped_no_annotation += 1
                 continue
 
+            in_dada_test = video_id in dada_test
+
+            if split == "test":
+
+                if not in_dada_test:
+                    skipped_videos += 1
+                    skipped_not_in_split += 1
+                    continue
+
+            elif split == "train":
+
+                if in_dada_test:
+                    skipped_videos += 1
+                    skipped_not_in_split += 1
+                    continue
+
+            elif split == "val":
+
+                # Jika val feature memang berasal dari subset
+                # RiskProp, hanya gunakan video yang ada di
+                # dada_test.
+                if not in_dada_test:
+                    skipped_videos += 1
+                    skipped_not_in_split += 1
+                    continue
+
             motion_path = video_dir / "motion.json"
-            interaction_path = video_dir / "interaction.json"
 
             if not motion_path.exists():
                 skipped_videos += 1
+                skipped_no_motion += 1
                 continue
+
+            interaction_path = video_dir / "interaction.json"
 
             if not interaction_path.exists():
                 skipped_videos += 1
-                continue
-
-            # ----------------------------------------------
-            # Load motion untuk memperoleh daftar frame
-            # ----------------------------------------------
-
-            try:
-                with open(
-                    motion_path,
-                    "r",
-                    encoding="utf-8",
-                ) as f:
-                    motion = json.load(f)
-
-            except Exception:
-                skipped_videos += 1
-                continue
-
-            frames = sorted(
-                {
-                    item["frame"]
-                    for obj in motion.values()
-                    for item in obj.get("features", [])
-                }
-            )
-
-            if len(frames) < self.sequence_length:
-                skipped_videos += 1
+                skipped_no_interaction += 1
                 continue
 
             ann = self.annotations[video_id]
 
-            accident = ann["accident"]
-            accident_frame = ann["accident_frame"]
+            if ann["accident"] == -1:
+                skipped_videos += 1
+                skipped_non_accident += 1
+                continue
 
-            # ----------------------------------------------
-            # Hanya gunakan frame sebelum kecelakaan
-            # ----------------------------------------------
-
-            if accident == 1:
-                valid_frames = [
-                    frame
-                    for frame in frames
-                    if frame < accident_frame
-                ]
-            else:
-                valid_frames = frames
-
-            if len(valid_frames) < self.sequence_length:
+            try:
+                category_id = int(video_id.split("_")[0])
+            except (ValueError, IndexError):
                 skipped_videos += 1
                 continue
 
-            # ----------------------------------------------
-            # Ambil sequence tetap.
-            #
-            # TAA menggunakan num_clips=30.
-            # Karena itu default MI-STN juga menggunakan
-            # sequence_length=30.
-            #
-            # Satu video = satu sample.
-            # ----------------------------------------------
+            if not 1 <= category_id <= 18:
+                skipped_videos += 1
+                continue
 
-            indices = np.linspace(
-                0,
-                len(valid_frames) - 1,
-                num=self.sequence_length,
-                dtype=int,
+            accident_frame = ann["accident_frame"]
+
+            positive_available = (
+                accident_frame - self.start_index
+                >= self.fps * 2
             )
 
-            selected_frames = [
-                valid_frames[i]
-                for i in indices
-            ]
+            if positive_available:
 
-            self.samples.append(
-                {
-                    "video_id": video_id,
-                    "frames": selected_frames,
-                    "accident": accident,
-                    "accident_frame": accident_frame,
-                    "abnormal_start": ann["abnormal_start"],
-                    "abnormal_end": ann["abnormal_end"],
-                    "total_frames": ann["total_frames"],
-                }
+                positive_frames = self._build_frame_sequence(
+                    accident_frame
+                )
+
+                self.samples.append(
+                    {
+                        "video_id": video_id,
+                        "frames": positive_frames,
+                        "target": True,
+                        "accident_frame": accident_frame,
+                        "abnormal_start": ann["abnormal_start"],
+                        "abnormal_end": ann["abnormal_end"],
+                        "total_frames": ann["total_frames"],
+                    }
+                )
+
+            negative_available = (
+                accident_frame - self.start_index
+                >= self.fps * 3.5
             )
 
-            matched_videos += 1
+            if negative_available:
 
-        print(
-            f"[MISTNDataset] "
-            f"split={split} "
-            f"videos={matched_videos} "
-            f"samples={len(self.samples)} "
-            f"skipped={skipped_videos}"
+                negative_end_frame = (
+                    accident_frame - self.fps * 3
+                )
+
+                negative_frames = self._build_frame_sequence(
+                    negative_end_frame
+                )
+
+                self.samples.append(
+                    {
+                        "video_id": video_id,
+                        "frames": negative_frames,
+                        "target": False,
+                        "accident_frame": accident_frame,
+                        "abnormal_start": ann["abnormal_start"],
+                        "abnormal_end": ann["abnormal_end"],
+                        "total_frames": ann["total_frames"],
+                    }
+                )
+
+            if positive_available or negative_available:
+                matched_videos += 1
+            else:
+                skipped_videos += 1
+                skipped_not_enough_frames += 1
+
+        # ========================================================
+        # Statistik
+        # ========================================================
+
+        positive_count = sum(
+            1
+            for sample in self.samples
+            if sample["target"] is True
         )
 
-        # --------------------------------------------------
-        # JSON cache
-        # --------------------------------------------------
+        negative_count = sum(
+            1
+            for sample in self.samples
+            if sample["target"] is False
+        )
+
+        print()
+        print("=" * 60)
+        print("[MISTNDataset]")
+        print(f"split             : {split}")
+        print(f"feature_root      : {self.feature_root}")
+        print(f"RiskProp test IDs : {len(dada_test)}")
+        print(f"available folders : {len(video_dirs)}")
+        print(f"matched videos    : {matched_videos}")
+        print(f"total samples     : {len(self.samples)}")
+        print(f"positive samples  : {positive_count}")
+        print(f"negative samples  : {negative_count}")
+        print(f"skipped videos    : {skipped_videos}")
+        print()
+        print("Skipped detail:")
+        print(f"  not in split     : {skipped_not_in_split}")
+        print(f"  no annotation    : {skipped_no_annotation}")
+        print(f"  no motion        : {skipped_no_motion}")
+        print(f"  no interaction   : {skipped_no_interaction}")
+        print(f"  non accident     : {skipped_non_accident}")
+        print(f"  insufficient     : {skipped_not_enough_frames}")
+        print("=" * 60)
+
+
+        print()
+        print(f"[MISTNDataset] Sample list ({split}):")
+
+        for i, sample in enumerate(self.samples):
+
+            print(
+                f"  [{i:03d}] "
+                f"{sample['video_id']} "
+                f"target={sample['target']} "
+                f"accident_frame={sample['accident_frame']}"
+            )
+
+        print()
 
         self._motion_cache = {}
         self._interaction_cache = {}
 
-    # ======================================================
-    # Length
-    # ======================================================
+    def _build_frame_sequence(self, end_frame):
+        """
+        Sampling 10 Hz seperti TAA/RiskProp.
+
+        DADA:
+            FPS = 30
+            frame_interval = 3
+            sequence_length = 30
+
+        Frame terakhir:
+            positive -> accident_frame
+            negative -> accident_frame - 90
+        """
+
+        clip_inds = (
+            torch.arange(
+                self.sequence_length,
+                dtype=torch.long,
+            )
+            * self.frame_interval
+        )
+
+        clip_inds_max = int(
+            clip_inds[-1].item()
+        )
+
+        clip_inds = (
+            clip_inds.numpy()
+            + end_frame
+            - self.start_index
+            - clip_inds_max
+        )
+
+        frame_inds = (
+            clip_inds.clip(min=0)
+            + self.start_index
+        )
+
+        return [
+            int(frame)
+            for frame in frame_inds
+        ]
+
 
     def __len__(self):
         return len(self.samples)
-
-    # ======================================================
-    # Motion loader
-    # ======================================================
 
     def _load_motion(self, video_id):
 
@@ -278,15 +366,9 @@ class MISTNDataset(Dataset):
                 "r",
                 encoding="utf-8",
             ) as f:
-
                 self._motion_cache[video_id] = json.load(f)
 
         return self._motion_cache[video_id]
-
-    # ======================================================
-    # Interaction loader
-    # ======================================================
-
     def _load_interaction(self, video_id):
 
         if video_id not in self._interaction_cache:
@@ -302,16 +384,13 @@ class MISTNDataset(Dataset):
                 "r",
                 encoding="utf-8",
             ) as f:
-
-                self._interaction_cache[
-                    video_id
-                ] = json.load(f)
+                self._interaction_cache[video_id] = json.load(f)
 
         return self._interaction_cache[video_id]
 
-    # ======================================================
-    # Get Item
-    # ======================================================
+    # ============================================================
+    # Get item
+    # ============================================================
 
     def __getitem__(self, idx):
 
@@ -320,7 +399,7 @@ class MISTNDataset(Dataset):
         video_id = sample["video_id"]
         target_frames = sample["frames"]
 
-        accident = sample["accident"]
+        target = sample["target"]
         accident_frame = sample["accident_frame"]
 
         motion = self._load_motion(video_id)
@@ -330,10 +409,6 @@ class MISTNDataset(Dataset):
         N = self.max_objects
         K = self.max_neighbors
         F = 9
-
-        # --------------------------------------------------
-        # Tensor allocation
-        # --------------------------------------------------
 
         motion_tensor = torch.zeros(
             T,
@@ -369,10 +444,6 @@ class MISTNDataset(Dataset):
             dtype=torch.float32,
         )
 
-        # --------------------------------------------------
-        # Object mapping
-        # --------------------------------------------------
-
         object_ids = list(motion.keys())[:N]
 
         object_to_idx = {
@@ -385,9 +456,9 @@ class MISTNDataset(Dataset):
             for t, frame in enumerate(target_frames)
         }
 
-        # ==================================================
-        # MOTION
-        # ==================================================
+        # ========================================================
+        # Motion
+        # ========================================================
 
         for object_id in object_ids:
 
@@ -399,7 +470,7 @@ class MISTNDataset(Dataset):
                 object_id
             ].get("features", []):
 
-                frame = item["frame"]
+                frame = int(item["frame"])
 
                 if frame not in frame_to_t:
                     continue
@@ -429,9 +500,9 @@ class MISTNDataset(Dataset):
                     object_idx,
                 ] = True
 
-        # ==================================================
-        # INTERACTION
-        # ==================================================
+        # ========================================================
+        # Interaction
+        # ========================================================
 
         for t, frame in enumerate(target_frames):
 
@@ -478,71 +549,40 @@ class MISTNDataset(Dataset):
                         k,
                     ] = True
 
-        # ==================================================
-        # LABEL
-        # ==================================================
+        # ========================================================
+        # Horizon labels
+        # ========================================================
 
-        if accident == 1:
+        if target is True:
 
-            for t, frame in enumerate(
-                target_frames
-            ):
+            for t, frame in enumerate(target_frames):
 
-                delta = (
-                    accident_frame - frame
-                )
+                delta = accident_frame - frame
 
-                for h, horizon in enumerate(
-                    self.horizons
-                ):
+                for h, horizon in enumerate(self.horizons):
 
                     if (
                         0 < delta <= self.fps * horizon
                     ):
                         labels[t, h] = 1.0
 
-        # ==================================================
-        # TAA-compatible metadata
-        # ==================================================
-
-        # IMPORTANT:
-        #
-        # Validation:
-        #   is_val=True
-        #   is_test=False
-        #
-        # Test:
-        #   is_val=True
-        #   is_test=True
-        #
-        # Test tetap is_val=True secara sengaja agar
-        # AnticipationMetric RiskProp menghitung bagian "@"
-        # saat tools/test.py dijalankan.
+        # ========================================================
+        # TAA metadata
+        # ========================================================
 
         is_test = self.split == "test"
 
-        is_val = (
-            self.split in ("val", "test")
+        is_val = self.split in (
+            "val",
+            "test",
         )
 
         return {
-            # ------------------------------------------------
-            # Model inputs
-            # ------------------------------------------------
-
             "motion": motion_tensor,
-
             "interaction": interaction_tensor,
-
             "motion_mask": motion_mask,
-
             "neighbor_mask": neighbor_mask,
-
             "labels": labels,
-
-            # ------------------------------------------------
-            # Temporal information
-            # ------------------------------------------------
 
             "frames": torch.tensor(
                 target_frames,
@@ -554,116 +594,65 @@ class MISTNDataset(Dataset):
                 dtype=torch.long,
             ),
 
-            # ------------------------------------------------
-            # Video metadata
-            # ------------------------------------------------
-
             "video_id": video_id,
-
-            "target": bool(accident),
+            "target": bool(target),
 
             "abnormal_start_frame": int(
                 sample["abnormal_start"]
             ),
 
             "dataset": "DADA2000",
-
             "frame_dir": video_id,
-
             "filename_tmpl": "{:04d}.png",
-
             "type": "DADA2000",
-
-            "start_index": 1,
+            "start_index": self.start_index,
 
             "total_frames": int(
                 sample["total_frames"]
             ),
 
-            # ------------------------------------------------
-            # TAA metadata
-            # ------------------------------------------------
-
             "is_val": is_val,
-
             "is_test": is_test,
         }
 
 
-# ============================================================
-# Collate Function
-# ============================================================
+# ================================================================
+# Collate
+# ================================================================
 
 @FUNCTIONS.register_module()
 def mistn_collate_fn(batch):
-    """
-    Collate batch MI-STN.
-
-    Format dibuat kompatibel dengan BaseModel MMEngine:
-
-        {
-            "inputs": {...},
-            "data_samples": [...]
-        }
-
-    sehingga tools/train.py dan tools/test.py
-    dapat tetap digunakan.
-    """
 
     return {
         "inputs": {
             "motion": torch.stack(
-                [
-                    item["motion"]
-                    for item in batch
-                ]
+                [item["motion"] for item in batch]
             ),
 
             "interaction": torch.stack(
-                [
-                    item["interaction"]
-                    for item in batch
-                ]
+                [item["interaction"] for item in batch]
             ),
 
             "motion_mask": torch.stack(
-                [
-                    item["motion_mask"]
-                    for item in batch
-                ]
+                [item["motion_mask"] for item in batch]
             ),
 
             "neighbor_mask": torch.stack(
-                [
-                    item["neighbor_mask"]
-                    for item in batch
-                ]
+                [item["neighbor_mask"] for item in batch]
             ),
 
             "labels": torch.stack(
-                [
-                    item["labels"]
-                    for item in batch
-                ]
+                [item["labels"] for item in batch]
             ),
 
             "frames": torch.stack(
-                [
-                    item["frames"]
-                    for item in batch
-                ]
+                [item["frames"] for item in batch]
             ),
 
             "accident_frame": torch.stack(
-                [
-                    item["accident_frame"]
-                    for item in batch
-                ]
+                [item["accident_frame"] for item in batch]
             ),
 
-            # Metadata masih berada di inputs karena
-            # MISTNRecognizer membutuhkan informasi ini
-            # saat predict().
             "video_id": [
                 item["video_id"]
                 for item in batch
