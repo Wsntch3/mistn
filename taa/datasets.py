@@ -1,7 +1,7 @@
-
 import json
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
@@ -33,6 +33,26 @@ class MISTNDataset(Dataset):
     Satu video dapat menghasilkan:
         - positive sample
         - negative sample
+
+    Frame window sampling:
+        Mengikuti RiskProp `SampleFramesBeforeAccident`:
+
+        - test_mode=True (val/test):
+            positive -> window fixed, berakhir tepat di accident_frame
+            negative -> window fixed, berakhir tepat 3 detik sebelum accident
+
+        - test_mode=False (train):
+            positive -> window berakhir di accident_frame + jitter kecil
+                        (0 s/d frame_interval), supaya model tidak
+                        menghafal titik akhir yang selalu persis sama
+            negative -> window diacak di SELURUH rentang aman
+                        (dari awal video sampai 3 detik sebelum accident),
+                        bukan fixed di satu titik saja
+
+        Randomisasi window negative saat training ini penting: tanpa ini,
+        model bisa "menghafal" jarak waktu tetap terhadap accident_frame
+        alih-alih belajar sinyal risiko yang sesungguhnya dari motion dan
+        interaction (shortcut learning).
     """
 
     def __init__(
@@ -69,7 +89,11 @@ class MISTNDataset(Dataset):
         self.horizons = tuple(horizons)
         self.fps = int(fps)
         self.stride = stride
-        self.test_mode = test_mode
+
+        # test_mode menentukan strategi sampling window (lihat docstring).
+        # Kalau tidak diberikan eksplisit, ikuti split (train -> False,
+        # val/test -> True), supaya tidak bergantung pada config eksternal.
+        self.test_mode = bool(test_mode) or (split != "train")
 
         if self.fps % 10 != 0:
             raise ValueError(
@@ -118,6 +142,11 @@ class MISTNDataset(Dataset):
 
         # ========================================================
         # Build samples
+        #
+        # PENTING: sekarang HANYA metadata yang disimpan di sini.
+        # Frame window (positif/negatif) TIDAK dihitung di __init__
+        # lagi -- itu dipindah ke __getitem__ lewat _sample_frame_inds(),
+        # supaya bisa diacak setiap epoch saat training.
         # ========================================================
 
         self.samples = []
@@ -159,15 +188,6 @@ class MISTNDataset(Dataset):
             # 2. SPLIT
             #
             # HANYA TRAIN menggunakan dada_test.
-            #
-            # TRAIN:
-            #   video yang ada di dada_test -> dikeluarkan
-            #
-            # VAL:
-            #   tidak menggunakan dada_test
-            #
-            # TEST:
-            #   tidak menggunakan dada_test
             # ----------------------------------------------------
 
             if split == "train":
@@ -178,10 +198,6 @@ class MISTNDataset(Dataset):
                     skipped_videos += 1
                     skipped_not_in_split += 1
                     continue
-
-            # ----------------------------------------------------
-            # VAL dan TEST TIDAK difilter dengan dada_test.
-            # ----------------------------------------------------
 
             # ----------------------------------------------------
             # 3. Feature motion harus tersedia
@@ -233,13 +249,10 @@ class MISTNDataset(Dataset):
             accident_frame = ann["accident_frame"]
 
             # ====================================================
-            # POSITIVE SAMPLE
+            # POSITIVE SAMPLE (metadata saja)
             #
             # Sama seperti RiskProp:
-            #
             # accident_frame - start_index >= fps * 2
-            #
-            # sequence berakhir di accident_frame
             # ====================================================
 
             positive_available = (
@@ -249,14 +262,9 @@ class MISTNDataset(Dataset):
 
             if positive_available:
 
-                positive_frames = self._build_frame_sequence(
-                    accident_frame
-                )
-
                 self.samples.append(
                     {
                         "video_id": video_id,
-                        "frames": positive_frames,
                         "target": True,
                         "accident_frame": accident_frame,
                         "abnormal_start": ann["abnormal_start"],
@@ -266,13 +274,10 @@ class MISTNDataset(Dataset):
                 )
 
             # ====================================================
-            # NEGATIVE SAMPLE
+            # NEGATIVE SAMPLE (metadata saja)
             #
             # Sama seperti RiskProp:
-            #
             # accident_frame - start_index >= fps * 3.5
-            #
-            # sequence berakhir 3 detik sebelum accident.
             # ====================================================
 
             negative_available = (
@@ -282,18 +287,9 @@ class MISTNDataset(Dataset):
 
             if negative_available:
 
-                negative_end_frame = (
-                    accident_frame - self.fps * 3
-                )
-
-                negative_frames = self._build_frame_sequence(
-                    negative_end_frame
-                )
-
                 self.samples.append(
                     {
                         "video_id": video_id,
-                        "frames": negative_frames,
                         "target": False,
                         "accident_frame": accident_frame,
                         "abnormal_start": ann["abnormal_start"],
@@ -333,6 +329,7 @@ class MISTNDataset(Dataset):
         print("[MISTNDataset]")
         print(f"split             : {split}")
         print(f"feature_root      : {self.feature_root}")
+        print(f"test_mode         : {self.test_mode}")
         print(f"RiskProp test IDs : {len(dada_test)}")
         print(f"available folders : {len(video_dirs)}")
         print(f"matched videos    : {matched_videos}")
@@ -372,39 +369,71 @@ class MISTNDataset(Dataset):
         self._interaction_cache = {}
 
     # ============================================================
-    # Build temporal frame sequence
+    # Sample frame indices (mengikuti RiskProp SampleFramesBeforeAccident)
     # ============================================================
 
-    def _build_frame_sequence(self, end_frame):
+    def _sample_frame_inds(self, accident_frame, target, total_frames):
 
         clip_inds = (
-            torch.arange(
-                self.sequence_length,
-                dtype=torch.long,
-            )
+            np.arange(self.sequence_length, dtype=np.int64)
             * self.frame_interval
         )
+        clip_inds_max = int(clip_inds[-1])
 
-        clip_inds_max = int(
-            clip_inds[-1].item()
+        safe_limit = (
+            accident_frame - self.start_index - self.fps * 3
         )
 
-        clip_inds = (
-            clip_inds.numpy()
-            + end_frame
-            - self.start_index
-            - clip_inds_max
-        )
+        if self.test_mode:
 
-        frame_inds = (
-            clip_inds.clip(min=0)
-            + self.start_index
-        )
+            if target is True:
+                # Fixed: window berakhir tepat di accident_frame
+                clip_inds = (
+                    clip_inds
+                    + accident_frame
+                    - self.start_index
+                    - clip_inds_max
+                )
+            else:
+                # Fixed: window berakhir tepat 3 detik sebelum accident
+                if safe_limit > clip_inds_max:
+                    clip_inds = clip_inds + 0
+                else:
+                    clip_inds = (
+                        clip_inds + safe_limit - clip_inds_max
+                    )
 
-        return [
-            int(frame)
-            for frame in frame_inds
-        ]
+        else:
+
+            if target is True:
+                # Jitter kecil di sekitar accident_frame
+                jitter = int(
+                    np.random.randint(0, self.frame_interval)
+                )
+                accident_ind = (
+                    accident_frame - self.start_index + jitter
+                )
+                accident_ind = min(
+                    accident_ind, total_frames - 1
+                )
+                clip_inds = clip_inds + accident_ind - clip_inds_max
+            else:
+                # Diacak di seluruh rentang aman (bukan fixed 1 titik)
+                if safe_limit > clip_inds_max:
+                    offset = int(
+                        np.random.randint(
+                            0, safe_limit - clip_inds_max
+                        )
+                    )
+                    clip_inds = clip_inds + offset
+                else:
+                    clip_inds = (
+                        clip_inds + safe_limit - clip_inds_max
+                    )
+
+        frame_inds = np.maximum(clip_inds, 0) + self.start_index
+
+        return [int(frame) for frame in frame_inds]
 
     # ============================================================
     # Length
@@ -468,10 +497,15 @@ class MISTNDataset(Dataset):
         sample = self.samples[idx]
 
         video_id = sample["video_id"]
-        target_frames = sample["frames"]
-
         target = sample["target"]
         accident_frame = sample["accident_frame"]
+        total_frames = sample["total_frames"]
+
+        # Frame window dihitung DI SINI, tiap kali dipanggil,
+        # bukan sekali di __init__.
+        target_frames = self._sample_frame_inds(
+            accident_frame, target, total_frames
+        )
 
         motion = self._load_motion(video_id)
         interaction = self._load_interaction(video_id)
@@ -688,7 +722,7 @@ class MISTNDataset(Dataset):
 
 
 # ================================================================
-# Collate
+# Collate (tidak berubah)
 # ================================================================
 
 @FUNCTIONS.register_module()
@@ -699,87 +733,40 @@ def mistn_collate_fn(batch):
             "motion": torch.stack(
                 [item["motion"] for item in batch]
             ),
-
             "interaction": torch.stack(
                 [item["interaction"] for item in batch]
             ),
-
             "motion_mask": torch.stack(
                 [item["motion_mask"] for item in batch]
             ),
-
             "neighbor_mask": torch.stack(
                 [item["neighbor_mask"] for item in batch]
             ),
-
             "labels": torch.stack(
                 [item["labels"] for item in batch]
             ),
-
             "frames": torch.stack(
                 [item["frames"] for item in batch]
             ),
-
             "accident_frame": torch.stack(
                 [item["accident_frame"] for item in batch]
             ),
-
-            "video_id": [
-                item["video_id"]
-                for item in batch
-            ],
-
-            "target": [
-                item["target"]
-                for item in batch
-            ],
-
+            "video_id": [item["video_id"] for item in batch],
+            "target": [item["target"] for item in batch],
             "abnormal_start_frame": [
-                item["abnormal_start_frame"]
-                for item in batch
+                item["abnormal_start_frame"] for item in batch
             ],
-
-            "dataset": [
-                item["dataset"]
-                for item in batch
-            ],
-
-            "frame_dir": [
-                item["frame_dir"]
-                for item in batch
-            ],
-
+            "dataset": [item["dataset"] for item in batch],
+            "frame_dir": [item["frame_dir"] for item in batch],
             "filename_tmpl": [
-                item["filename_tmpl"]
-                for item in batch
+                item["filename_tmpl"] for item in batch
             ],
-
-            "type": [
-                item["type"]
-                for item in batch
-            ],
-
-            "start_index": [
-                item["start_index"]
-                for item in batch
-            ],
-
-            "total_frames": [
-                item["total_frames"]
-                for item in batch
-            ],
-
-            "is_val": [
-                item["is_val"]
-                for item in batch
-            ],
-
-            "is_test": [
-                item["is_test"]
-                for item in batch
-            ],
+            "type": [item["type"] for item in batch],
+            "start_index": [item["start_index"] for item in batch],
+            "total_frames": [item["total_frames"] for item in batch],
+            "is_val": [item["is_val"] for item in batch],
+            "is_test": [item["is_test"] for item in batch],
         },
-
         "data_samples": [
             {
                 "video_id": item["video_id"],
@@ -790,4 +777,3 @@ def mistn_collate_fn(batch):
             for item in batch
         ],
     }
-
