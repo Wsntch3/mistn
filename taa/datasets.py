@@ -1,3 +1,4 @@
+
 import json
 from pathlib import Path
 
@@ -8,29 +9,30 @@ from torch.utils.data import Dataset
 from mmaction.registry import DATASETS
 from mmengine.registry import FUNCTIONS
 
-
 from taa.splits import dada_test
 
 
 @DATASETS.register_module()
 class MISTNDataset(Dataset):
     """
-    MI-STN dataset dengan pembagian video dan semantics sampling
-    yang mengikuti RiskProp/TAA.
+    MI-STN dataset.
 
-    Prinsip utama:
-        - RiskProp menentukan video mana yang masuk train/test.
-        - MI-STN hanya menggunakan feature dari video tersebut.
-        - Satu video dapat menghasilkan:
-            target=True
-            target=False
-        - Sehingga jumlah SAMPLE tidak sama dengan jumlah VIDEO.
+    Split:
+        TRAIN:
+            mengikuti RiskProp/TAA:
+            video yang ada di dada_test dikeluarkan dari train.
 
-    DADA-2000:
-        FPS             = 30
-        Sampling        = 10 Hz
-        Frame interval  = 3 frame
-        Sequence length = 30 timestep
+        VAL:
+            menggunakan seluruh feature yang tersedia di folder val
+            dan tidak difilter dengan dada_test.
+
+        TEST:
+            menggunakan seluruh feature yang tersedia di folder test
+            dan tidak difilter dengan dada_test.
+
+    Satu video dapat menghasilkan:
+        - positive sample
+        - negative sample
     """
 
     def __init__(
@@ -123,7 +125,7 @@ class MISTNDataset(Dataset):
         matched_videos = 0
         skipped_videos = 0
 
-        # Statistik khusus untuk debugging
+        # Statistik debugging
         skipped_not_in_split = 0
         skipped_no_annotation = 0
         skipped_no_motion = 0
@@ -154,28 +156,23 @@ class MISTNDataset(Dataset):
                 continue
 
             # ----------------------------------------------------
-            # 2. FILTER SPLIT SAMA SEPERTI RISKPROP
+            # 2. SPLIT
             #
-            # RiskProp:
-            #
-            # TEST:
-            # video_id IN dada_test
+            # HANYA TRAIN menggunakan dada_test.
             #
             # TRAIN:
-            # video_id NOT IN dada_test
+            #   video yang ada di dada_test -> dikeluarkan
             #
+            # VAL:
+            #   tidak menggunakan dada_test
+            #
+            # TEST:
+            #   tidak menggunakan dada_test
             # ----------------------------------------------------
 
-            in_dada_test = video_id in dada_test
+            if split == "train":
 
-            if split == "test":
-
-                if not in_dada_test:
-                    skipped_videos += 1
-                    skipped_not_in_split += 1
-                    continue
-
-            elif split == "train":
+                in_dada_test = video_id in dada_test
 
                 if in_dada_test:
                     skipped_videos += 1
@@ -183,24 +180,8 @@ class MISTNDataset(Dataset):
                     continue
 
             # ----------------------------------------------------
-            # VAL
-            #
-            # Untuk sementara validation mengikuti subset
-            # yang ditentukan oleh konfigurasi MI-STN.
-            #
-            # Jangan mengubah train/test berdasarkan folder
-            # feature saja.
+            # VAL dan TEST TIDAK difilter dengan dada_test.
             # ----------------------------------------------------
-
-            elif split == "val":
-
-                # Jika val feature memang berasal dari subset
-                # RiskProp, hanya gunakan video yang ada di
-                # dada_test.
-                if not in_dada_test:
-                    skipped_videos += 1
-                    skipped_not_in_split += 1
-                    continue
 
             # ----------------------------------------------------
             # 3. Feature motion harus tersedia
@@ -227,8 +208,7 @@ class MISTNDataset(Dataset):
             ann = self.annotations[video_id]
 
             # ----------------------------------------------------
-            # 5. Sama seperti RiskProp:
-            #    hanya accident video
+            # 5. Hanya accident video
             # ----------------------------------------------------
 
             if ann["accident"] == -1:
@@ -236,15 +216,8 @@ class MISTNDataset(Dataset):
                 skipped_non_accident += 1
                 continue
 
-            # RiskProp juga membatasi ego-car accident:
-            # category 1-18.
-            #
-            # video_id format:
-            #     category_video
-            #
-            # contoh:
-            #     1_001
-            #     5_032
+            # ----------------------------------------------------
+            # 6. RiskProp: category 1-18
             # ----------------------------------------------------
 
             try:
@@ -262,7 +235,7 @@ class MISTNDataset(Dataset):
             # ====================================================
             # POSITIVE SAMPLE
             #
-            # Sama dengan RiskProp:
+            # Sama seperti RiskProp:
             #
             # accident_frame - start_index >= fps * 2
             #
@@ -295,7 +268,7 @@ class MISTNDataset(Dataset):
             # ====================================================
             # NEGATIVE SAMPLE
             #
-            # Sama dengan RiskProp:
+            # Sama seperti RiskProp:
             #
             # accident_frame - start_index >= fps * 3.5
             #
@@ -328,6 +301,10 @@ class MISTNDataset(Dataset):
                         "total_frames": ann["total_frames"],
                     }
                 )
+
+            # ----------------------------------------------------
+            # Video berhasil menghasilkan sample
+            # ----------------------------------------------------
 
             if positive_available or negative_available:
                 matched_videos += 1
@@ -374,8 +351,7 @@ class MISTNDataset(Dataset):
         print("=" * 60)
 
         # ========================================================
-        # PRINT SAMPLE LIST
-        # Sangat penting untuk membandingkan dengan RiskProp
+        # Print sample list
         # ========================================================
 
         print()
@@ -400,18 +376,6 @@ class MISTNDataset(Dataset):
     # ============================================================
 
     def _build_frame_sequence(self, end_frame):
-        """
-        Sampling 10 Hz seperti TAA/RiskProp.
-
-        DADA:
-            FPS = 30
-            frame_interval = 3
-            sequence_length = 30
-
-        Frame terakhir:
-            positive -> accident_frame
-            negative -> accident_frame - 90
-        """
 
         clip_inds = (
             torch.arange(
@@ -826,3 +790,4 @@ def mistn_collate_fn(batch):
             for item in batch
         ],
     }
+
