@@ -1,373 +1,831 @@
-# Copyright (c) OpenMMLab. All rights reserved.
-import copy
-import os.path as osp
+%cd /content/RiskProp
 
-from mmengine.fileio import exists
-
-from mmaction.registry import DATASETS
-from mmengine.dataset import Compose, BaseDataset
+%%writefile mi_stn/dataset.py
+import json
+from pathlib import Path
 
 import pandas as pd
-import numpy as np
+import torch
+from torch.utils.data import Dataset
 
-from .utils import get_fps
-from .splits import cap_test, dada_test, nexar_val
+from mmaction.registry import DATASETS
+from mmengine.registry import FUNCTIONS
+
+
+from taa.splits import dada_test
 
 
 @DATASETS.register_module()
-class MultiDataset(BaseDataset):
+class MISTNDataset(Dataset):
+    """
+    MI-STN dataset dengan pembagian video dan semantics sampling
+    yang mengikuti RiskProp/TAA.
+
+    Prinsip utama:
+        - RiskProp menentukan video mana yang masuk train/test.
+        - MI-STN hanya menggunakan feature dari video tersebut.
+        - Satu video dapat menghasilkan:
+            target=True
+            target=False
+        - Sehingga jumlah SAMPLE tidak sama dengan jumlah VIDEO.
+
+    DADA-2000:
+        FPS             = 30
+        Sampling        = 10 Hz
+        Frame interval  = 3 frame
+        Sequence length = 30 timestep
+    """
+
     def __init__(
         self,
-        cap=None,
-        dada=None,
-        d2city=None,
-        nexar=None,
-        pipeline_video=None,
-        pipeline_frame=None,
-        modality="rgb",
+        split,
+        annotation_file="/content/data_text_annotation.xlsx",
+        feature_root="/content/MI-STN/features",
+        data_root=None,
+        sequence_length=30,
+        max_objects=50,
+        max_neighbors=5,
+        horizons=(1, 2, 3),
+        fps=30,
+        stride=None,
         test_mode=False,
-        train_with_val=False,
-        val_train=False,
-        indices=None,
-    ) -> None:
-        self.cap = cap
-        self.dada = dada
-        self.d2city = d2city
-        self.nexar = nexar
+    ):
+        super().__init__()
 
-        self._cap_texts = {}
-        if cap is not None:
-            self._cap_texts = self._load_cap_texts(cap)
+        self.split = split
 
-        self.modality = modality
-        assert self.modality in ["rgb", "flow", "both", "two_stream"], f"modality {self.modality} is not supported"
+        if data_root is not None:
+            feature_root = data_root
+
+        self.feature_root = Path(feature_root) / split
+
+        if not self.feature_root.exists():
+            raise FileNotFoundError(
+                f"Feature directory tidak ditemukan: {self.feature_root}"
+            )
+
+        self.sequence_length = int(sequence_length)
+        self.max_objects = int(max_objects)
+        self.max_neighbors = int(max_neighbors)
+        self.horizons = tuple(horizons)
+        self.fps = int(fps)
+        self.stride = stride
         self.test_mode = test_mode
-        self.train_with_val = train_with_val
-        self.val_train = val_train
-        self._indices = indices
-        self._metainfo = self._load_metainfo(None)
-        self.serialize_data = True
-        self.max_refetch = 1000
 
-        self.pipeline_video = Compose(pipeline_video)
-        self.pipeline_frame = Compose(pipeline_frame)
+        if self.fps % 10 != 0:
+            raise ValueError(
+                f"FPS {self.fps} tidak kompatibel dengan sampling TAA 10 Hz."
+            )
 
-        self.full_init()
+        # DADA 30 FPS -> 10 Hz
+        self.frame_interval = self.fps // 10
 
-    def _load_cap_texts(self, cap_cfg):
-        ann_path = osp.join(cap_cfg["data_root"], cap_cfg["ann_file"])
-        if not exists(ann_path):
-            return {}
-        try:
-            df = pd.read_excel(ann_path, sheet_name=1)
-        except Exception:
-            df = pd.read_excel(ann_path)
+        # Sama dengan RiskProp
+        self.start_index = 1
 
-        desired = {"fact", "effect", "reason", "introspection", "description", "advice", "text"}
-        text_columns = [col for col in df.columns if str(col).strip().lower() in desired]
-        text_map = {}
+        annotation_file = Path(annotation_file)
+
+        if not annotation_file.exists():
+            raise FileNotFoundError(
+                f"Annotation file tidak ditemukan: {annotation_file}"
+            )
+
+        # ========================================================
+        # Load annotation DADA
+        # ========================================================
+
+        df = pd.read_excel(
+            annotation_file,
+            sheet_name=1,
+            header=None,
+        )
+
+        self.annotations = {}
+
         for _, row in df.iterrows():
-            video_id = str(row.iloc[0]).zfill(6)
-            snippets = []
-            for col in text_columns:
-                value = row.get(col)
-                if isinstance(value, str):
-                    value = value.strip()
-                if value:
-                    snippets.append(str(value))
-            text_map[video_id] = " ".join(snippets)
-        return text_map
+            try:
+                video_id = f"{int(row[5])}_{str(row[0]).zfill(3)}"
 
-    def load_data_list(self):
-        data_list = []
-        if self.cap:
-            ann_path = osp.join(self.cap["data_root"], self.cap["ann_file"])
-            fin = pd.read_excel(ann_path, sheet_name=1).values.tolist()
-            for line in fin:
-                video_id = str(line[0]).zfill(6)
-                caption = self._cap_texts.get(video_id, "")
-                if 1 <= line[5] <= 10:
-                    frame_dir = "1-10"
-                elif line[5] == 11:
-                    frame_dir = "11"
-                elif 12 <= line[5] <= 42:
-                    frame_dir = "12-42"
-                elif line[5] == 43:
-                    frame_dir = "43"
-                elif 44 <= line[5] <= 62:
-                    frame_dir = "44-62"
-                frame_dir = osp.join(self.cap["data_root"], frame_dir, str(line[5]), video_id, "images")
-                fps = get_fps(video_id, dataset_type="cap")
-
-                # skip the broken videos
-                if video_id in ["011665", "008728", "004928", "007155"]:
-                    continue
-
-                # only for ego-car accidents
-                if not 1 <= line[5] <= 18:
-                    continue
-
-                # keep the train videos
-                if not self.test_mode and not self.train_with_val and video_id in cap_test.keys():
-                    continue
-
-                # keep the test videos
-                if self.test_mode and not self.val_train and video_id not in cap_test.keys():
-                    continue
-
-                correct_total_frames = {
-                    "005722": 78,
-                    "009073": 211,
-                    "009074": 220,
-                    "009480": 586,
-                    "010087": 301,
-                    "009541": 453,
-                    "009222": 303,
-                    "009255": 217,
-                    "008589": 106,
+                self.annotations[video_id] = {
+                    "accident": int(row[6]),
+                    "abnormal_start": int(row[7]),
+                    "accident_frame": int(row[8]),
+                    "abnormal_end": int(row[9]),
+                    "total_frames": int(row[10]),
                 }
 
-                # fix the total frames
-                if video_id in correct_total_frames.keys():
-                    line[10] = correct_total_frames[video_id]
+            except (TypeError, ValueError, IndexError):
+                continue
 
-                if line[9] - self.cap["start_index"] >= fps * 2:
-                    data_list.append(
-                        dict(
-                            dataset="cap",
-                            filename=None,
-                            frame_dir=frame_dir,
-                            filename_tmpl=self.cap["filename_tmpl"],
-                            start_index=self.cap["start_index"],
-                            video_id=video_id,
-                            type=line[5],
-                            target=True,
-                            abnormal_start_frame=line[7],
-                            accident_frame=line[9],
-                            total_frames=line[10],
-                            fps=fps,
-                            is_val=video_id in cap_test.keys(),
-                            is_test=False,
-                            text=caption,
-                        )
-                    )
+        # ========================================================
+        # Build samples
+        # ========================================================
 
-                if line[9] - self.cap["start_index"] >= fps * 3.5:
-                    data_list.append(
-                        dict(
-                            dataset="cap",
-                            filename=None,
-                            frame_dir=frame_dir,
-                            filename_tmpl=self.cap["filename_tmpl"],
-                            start_index=self.cap["start_index"],
-                            video_id=video_id,
-                            type=line[5],
-                            target=False,
-                            abnormal_start_frame=line[7],
-                            accident_frame=line[9],
-                            total_frames=line[10],
-                            fps=fps,
-                            is_val=video_id in cap_test.keys(),
-                            is_test=False,
-                            text=caption,
-                        )
-                    )
+        self.samples = []
 
-        if self.dada:
-            fin = pd.read_excel(osp.join(self.dada["data_root"], self.dada["ann_file"]), sheet_name=1).values.tolist()
-            for line in fin:
-                video_id = str(line[0]).zfill(3)
-                frame_dir = osp.join(self.dada["data_root"], str(line[5]), video_id, "images")
-                video_id = f"{line[5]}_{video_id}"
-                fps = get_fps(video_id, dataset_type="dada")
+        matched_videos = 0
+        skipped_videos = 0
 
-                # skip the videos without accidents
-                if line[8] == -1:
+        # Statistik khusus untuk debugging
+        skipped_not_in_split = 0
+        skipped_no_annotation = 0
+        skipped_no_motion = 0
+        skipped_no_interaction = 0
+        skipped_non_accident = 0
+        skipped_not_enough_frames = 0
+
+        video_dirs = sorted(
+            p for p in self.feature_root.iterdir()
+            if p.is_dir()
+        )
+
+        # ========================================================
+        # LOOP VIDEO
+        # ========================================================
+
+        for video_dir in video_dirs:
+
+            video_id = video_dir.name
+
+            # ----------------------------------------------------
+            # 1. Harus ada annotation
+            # ----------------------------------------------------
+
+            if video_id not in self.annotations:
+                skipped_videos += 1
+                skipped_no_annotation += 1
+                continue
+
+            # ----------------------------------------------------
+            # 2. FILTER SPLIT SAMA SEPERTI RISKPROP
+            #
+            # RiskProp:
+            #
+            # TEST:
+            # video_id IN dada_test
+            #
+            # TRAIN:
+            # video_id NOT IN dada_test
+            #
+            # ----------------------------------------------------
+
+            in_dada_test = video_id in dada_test
+
+            if split == "test":
+
+                if not in_dada_test:
+                    skipped_videos += 1
+                    skipped_not_in_split += 1
                     continue
 
-                # only for ego-car accidents
-                if not 1 <= line[5] <= 18:
+            elif split == "train":
+
+                if in_dada_test:
+                    skipped_videos += 1
+                    skipped_not_in_split += 1
                     continue
 
-                # keep the train videos
-                if not self.test_mode and not self.train_with_val and video_id in dada_test.keys():
+            # ----------------------------------------------------
+            # VAL
+            #
+            # Untuk sementara validation mengikuti subset
+            # yang ditentukan oleh konfigurasi MI-STN.
+            #
+            # Jangan mengubah train/test berdasarkan folder
+            # feature saja.
+            # ----------------------------------------------------
+
+            elif split == "val":
+
+                # Jika val feature memang berasal dari subset
+                # RiskProp, hanya gunakan video yang ada di
+                # dada_test.
+                if not in_dada_test:
+                    skipped_videos += 1
+                    skipped_not_in_split += 1
                     continue
 
-                # keep the test videos
-                if self.test_mode and not self.val_train and video_id not in dada_test.keys():
-                    continue
+            # ----------------------------------------------------
+            # 3. Feature motion harus tersedia
+            # ----------------------------------------------------
 
-                correct_total_frames = {
-                    "5_040": 382,
-                    "5_049": 204,
-                    "6_009": 325,
-                    "10_169": 320,
-                    "11_076": 666,
-                    "11_139": 220,
-                    "36_002": 342,
-                    "37_003": 695,
-                    "43_080": 338,
-                    "43_188": 220,
-                    "48_065": 330,
-                    "50_136": 422,
-                    "56_008": 433,
-                }
+            motion_path = video_dir / "motion.json"
 
-                # fix the total frames
-                if video_id in correct_total_frames.keys():
-                    line[10] = correct_total_frames[video_id]
+            if not motion_path.exists():
+                skipped_videos += 1
+                skipped_no_motion += 1
+                continue
 
-                if line[8] - self.dada["start_index"] >= fps * 2:
-                    data_list.append(
-                        dict(
-                            dataset="dada",
-                            filename=None,
-                            frame_dir=frame_dir,
-                            filename_tmpl=self.dada["filename_tmpl"],
-                            start_index=self.dada["start_index"],
-                            video_id=video_id,
-                            type=line[5],
-                            target=True,
-                            abnormal_start_frame=line[7],
-                            accident_frame=line[8],
-                            total_frames=line[10],
-                            fps=fps,
-                            is_val=video_id in dada_test.keys(),
-                            is_test=False,
-                        )
-                    )
+            # ----------------------------------------------------
+            # 4. Feature interaction harus tersedia
+            # ----------------------------------------------------
 
-                if line[8] - self.dada["start_index"] >= fps * 3.5:
-                    data_list.append(
-                        dict(
-                            dataset="dada",
-                            filename=None,
-                            frame_dir=frame_dir,
-                            filename_tmpl=self.dada["filename_tmpl"],
-                            start_index=self.dada["start_index"],
-                            video_id=video_id,
-                            type=line[5],
-                            target=False,
-                            abnormal_start_frame=line[7],
-                            accident_frame=line[8],
-                            total_frames=line[10],
-                            fps=fps,
-                            is_val=video_id in dada_test.keys(),
-                            is_test=False,
-                        )
-                    )
+            interaction_path = video_dir / "interaction.json"
 
-        if self.d2city:
-            fin = pd.read_csv(osp.join(self.d2city["data_root"], self.d2city["ann_file"])).values.tolist()
-            for line in fin:
-                video_id = line[0]
-                filename = osp.join(self.d2city["data_root"], "raw", str(int(line[1])).zfill(4), video_id + ".mp4")
-                fps = 20 if np.random.rand() < 0.5 else 30
+            if not interaction_path.exists():
+                skipped_videos += 1
+                skipped_no_interaction += 1
+                continue
 
-                # keep the train videos
-                if self.test_mode:
-                    continue
+            ann = self.annotations[video_id]
 
-                if np.random.rand() < 0.8:
-                    continue
+            # ----------------------------------------------------
+            # 5. Sama seperti RiskProp:
+            #    hanya accident video
+            # ----------------------------------------------------
 
-                data_list.append(
-                    dict(
-                        dataset="d2city",
-                        filename=filename,
-                        frame_dir=None,
-                        filename_tmpl=None,
-                        start_index=0,
-                        video_id=video_id,
-                        type=None,
-                        target=False,
-                        abnormal_start_frame=None,
-                        accident_frame=None,
-                        total_frames=int(line[2]),
-                        fps=fps,
-                        is_val=False,
-                        is_test=False,
-                    )
+            if ann["accident"] == -1:
+                skipped_videos += 1
+                skipped_non_accident += 1
+                continue
+
+            # RiskProp juga membatasi ego-car accident:
+            # category 1-18.
+            #
+            # video_id format:
+            #     category_video
+            #
+            # contoh:
+            #     1_001
+            #     5_032
+            # ----------------------------------------------------
+
+            try:
+                category_id = int(video_id.split("_")[0])
+            except (ValueError, IndexError):
+                skipped_videos += 1
+                continue
+
+            if not 1 <= category_id <= 18:
+                skipped_videos += 1
+                continue
+
+            accident_frame = ann["accident_frame"]
+
+            # ====================================================
+            # POSITIVE SAMPLE
+            #
+            # Sama dengan RiskProp:
+            #
+            # accident_frame - start_index >= fps * 2
+            #
+            # sequence berakhir di accident_frame
+            # ====================================================
+
+            positive_available = (
+                accident_frame - self.start_index
+                >= self.fps * 2
+            )
+
+            if positive_available:
+
+                positive_frames = self._build_frame_sequence(
+                    accident_frame
                 )
 
-        if self.nexar:
-            fin = pd.read_csv(osp.join(self.nexar["data_root"], self.nexar["ann_file"])).values.tolist()
-            for line in fin:
-                video_id = str(int(line[0])).zfill(5)
-                is_test = bool(line[1])
-                target = bool(line[6]) if not is_test else None
-                if not is_test:
-                    filename = "train"
-                    frame_dir = "train_raw_frames"
-                else:
-                    filename = "test"
-                    frame_dir = "test_raw_frames"
-                filename = osp.join(self.nexar["data_root"], filename, video_id + ".mp4")
-                frame_dir = osp.join(self.nexar["data_root"], frame_dir, video_id)
-                fps = 30
-
-                # keep the train videos
-                if not self.test_mode and is_test:
-                    continue
-
-                if not self.test_mode and not self.train_with_val and video_id in nexar_val:
-                    continue
-
-                # keep the test videos
-                if self.test_mode and not self.val_train and video_id not in nexar_val and not is_test:
-                    continue
-
-                data_list.append(
-                    dict(
-                        dataset="nexar",
-                        filename=filename,
-                        frame_dir=frame_dir,
-                        filename_tmpl=self.nexar["filename_tmpl"],
-                        start_index=self.nexar["start_index"],
-                        video_id=video_id,
-                        type=None,
-                        target=target,
-                        abnormal_start_frame=int(line[4]) if not is_test and target else None,
-                        accident_frame=int(line[5]) if not is_test and target else None,
-                        total_frames=int(line[2]),
-                        fps=fps,
-                        is_val=video_id in nexar_val,
-                        is_test=is_test,
-                    )
+                self.samples.append(
+                    {
+                        "video_id": video_id,
+                        "frames": positive_frames,
+                        "target": True,
+                        "accident_frame": accident_frame,
+                        "abnormal_start": ann["abnormal_start"],
+                        "abnormal_end": ann["abnormal_end"],
+                        "total_frames": ann["total_frames"],
+                    }
                 )
-        return data_list
 
-    def prepare_data(self, idx):
-        data_info = self.get_data_info(idx)
-        if data_info["dataset"] in ["d2city"]:
-            pipeline = self.pipeline_video
-        else:
-            pipeline = self.pipeline_frame
-        if self.modality == "two_stream":
-            data_info["flow"] = False
-            data_info_flow = None
-            for t in pipeline.transforms:
-                if t.__class__.__name__ in ["RandomResizedCrop", "Resize", "Flip", "Flow"]:
-                    if data_info_flow is None:
-                        data_info_flow = copy.deepcopy(data_info)
-                        data_info_flow["flow"] = True
-                    data_info = t(data_info)
-                    data_info_flow = t(data_info_flow)
-                    if t.__class__.__name__ == "Flow":
-                        data_info["imgs"] = [
-                            np.concatenate([frame, flow], axis=-2) for frame, flow in zip(data_info["imgs"], data_info_flow["imgs"])
-                        ]
-                        del data_info_flow
-                else:
-                    data_info = t(data_info)
-            return data_info
-        else:
-            return pipeline(data_info)
+            # ====================================================
+            # NEGATIVE SAMPLE
+            #
+            # Sama dengan RiskProp:
+            #
+            # accident_frame - start_index >= fps * 3.5
+            #
+            # sequence berakhir 3 detik sebelum accident.
+            # ====================================================
 
-    def get_data_info(self, idx: int) -> dict:
-        """Get annotation by index."""
-        data_info = super().get_data_info(idx)
-        data_info["modality"] = "RGB"
-        if data_info.get("dataset") == "cap":
-            data_info["text"] = self._cap_texts.get(data_info["video_id"], "")
-        return data_info
+            negative_available = (
+                accident_frame - self.start_index
+                >= self.fps * 3.5
+            )
+
+            if negative_available:
+
+                negative_end_frame = (
+                    accident_frame - self.fps * 3
+                )
+
+                negative_frames = self._build_frame_sequence(
+                    negative_end_frame
+                )
+
+                self.samples.append(
+                    {
+                        "video_id": video_id,
+                        "frames": negative_frames,
+                        "target": False,
+                        "accident_frame": accident_frame,
+                        "abnormal_start": ann["abnormal_start"],
+                        "abnormal_end": ann["abnormal_end"],
+                        "total_frames": ann["total_frames"],
+                    }
+                )
+
+            if positive_available or negative_available:
+                matched_videos += 1
+            else:
+                skipped_videos += 1
+                skipped_not_enough_frames += 1
+
+        # ========================================================
+        # Statistik
+        # ========================================================
+
+        positive_count = sum(
+            1
+            for sample in self.samples
+            if sample["target"] is True
+        )
+
+        negative_count = sum(
+            1
+            for sample in self.samples
+            if sample["target"] is False
+        )
+
+        print()
+        print("=" * 60)
+        print("[MISTNDataset]")
+        print(f"split             : {split}")
+        print(f"feature_root      : {self.feature_root}")
+        print(f"RiskProp test IDs : {len(dada_test)}")
+        print(f"available folders : {len(video_dirs)}")
+        print(f"matched videos    : {matched_videos}")
+        print(f"total samples     : {len(self.samples)}")
+        print(f"positive samples  : {positive_count}")
+        print(f"negative samples  : {negative_count}")
+        print(f"skipped videos    : {skipped_videos}")
+        print()
+        print("Skipped detail:")
+        print(f"  not in split     : {skipped_not_in_split}")
+        print(f"  no annotation    : {skipped_no_annotation}")
+        print(f"  no motion        : {skipped_no_motion}")
+        print(f"  no interaction   : {skipped_no_interaction}")
+        print(f"  non accident     : {skipped_non_accident}")
+        print(f"  insufficient     : {skipped_not_enough_frames}")
+        print("=" * 60)
+
+        # ========================================================
+        # PRINT SAMPLE LIST
+        # Sangat penting untuk membandingkan dengan RiskProp
+        # ========================================================
+
+        print()
+        print(f"[MISTNDataset] Sample list ({split}):")
+
+        for i, sample in enumerate(self.samples):
+
+            print(
+                f"  [{i:03d}] "
+                f"{sample['video_id']} "
+                f"target={sample['target']} "
+                f"accident_frame={sample['accident_frame']}"
+            )
+
+        print()
+
+        self._motion_cache = {}
+        self._interaction_cache = {}
+
+    # ============================================================
+    # Build temporal frame sequence
+    # ============================================================
+
+    def _build_frame_sequence(self, end_frame):
+        """
+        Sampling 10 Hz seperti TAA/RiskProp.
+
+        DADA:
+            FPS = 30
+            frame_interval = 3
+            sequence_length = 30
+
+        Frame terakhir:
+            positive -> accident_frame
+            negative -> accident_frame - 90
+        """
+
+        clip_inds = (
+            torch.arange(
+                self.sequence_length,
+                dtype=torch.long,
+            )
+            * self.frame_interval
+        )
+
+        clip_inds_max = int(
+            clip_inds[-1].item()
+        )
+
+        clip_inds = (
+            clip_inds.numpy()
+            + end_frame
+            - self.start_index
+            - clip_inds_max
+        )
+
+        frame_inds = (
+            clip_inds.clip(min=0)
+            + self.start_index
+        )
+
+        return [
+            int(frame)
+            for frame in frame_inds
+        ]
+
+    # ============================================================
+    # Length
+    # ============================================================
+
+    def __len__(self):
+        return len(self.samples)
+
+    # ============================================================
+    # Load motion
+    # ============================================================
+
+    def _load_motion(self, video_id):
+
+        if video_id not in self._motion_cache:
+
+            path = (
+                self.feature_root
+                / video_id
+                / "motion.json"
+            )
+
+            with open(
+                path,
+                "r",
+                encoding="utf-8",
+            ) as f:
+                self._motion_cache[video_id] = json.load(f)
+
+        return self._motion_cache[video_id]
+
+    # ============================================================
+    # Load interaction
+    # ============================================================
+
+    def _load_interaction(self, video_id):
+
+        if video_id not in self._interaction_cache:
+
+            path = (
+                self.feature_root
+                / video_id
+                / "interaction.json"
+            )
+
+            with open(
+                path,
+                "r",
+                encoding="utf-8",
+            ) as f:
+                self._interaction_cache[video_id] = json.load(f)
+
+        return self._interaction_cache[video_id]
+
+    # ============================================================
+    # Get item
+    # ============================================================
+
+    def __getitem__(self, idx):
+
+        sample = self.samples[idx]
+
+        video_id = sample["video_id"]
+        target_frames = sample["frames"]
+
+        target = sample["target"]
+        accident_frame = sample["accident_frame"]
+
+        motion = self._load_motion(video_id)
+        interaction = self._load_interaction(video_id)
+
+        T = self.sequence_length
+        N = self.max_objects
+        K = self.max_neighbors
+        F = 9
+
+        motion_tensor = torch.zeros(
+            T,
+            N,
+            F,
+            dtype=torch.float32,
+        )
+
+        interaction_tensor = torch.zeros(
+            T,
+            N,
+            K,
+            F,
+            dtype=torch.float32,
+        )
+
+        motion_mask = torch.zeros(
+            T,
+            N,
+            dtype=torch.bool,
+        )
+
+        neighbor_mask = torch.zeros(
+            T,
+            N,
+            K,
+            dtype=torch.bool,
+        )
+
+        labels = torch.zeros(
+            T,
+            len(self.horizons),
+            dtype=torch.float32,
+        )
+
+        object_ids = list(motion.keys())[:N]
+
+        object_to_idx = {
+            str(object_id): i
+            for i, object_id in enumerate(object_ids)
+        }
+
+        frame_to_t = {
+            frame: t
+            for t, frame in enumerate(target_frames)
+        }
+
+        # ========================================================
+        # Motion
+        # ========================================================
+
+        for object_id in object_ids:
+
+            object_idx = object_to_idx[
+                str(object_id)
+            ]
+
+            for item in motion[
+                object_id
+            ].get("features", []):
+
+                frame = int(item["frame"])
+
+                if frame not in frame_to_t:
+                    continue
+
+                t = frame_to_t[frame]
+
+                motion_tensor[
+                    t,
+                    object_idx,
+                ] = torch.tensor(
+                    [
+                        item["x"],
+                        item["y"],
+                        item["vx"],
+                        item["vy"],
+                        item["speed"],
+                        item["ax"],
+                        item["ay"],
+                        item["accel"],
+                        item["direction"],
+                    ],
+                    dtype=torch.float32,
+                )
+
+                motion_mask[
+                    t,
+                    object_idx,
+                ] = True
+
+        # ========================================================
+        # Interaction
+        # ========================================================
+
+        for t, frame in enumerate(target_frames):
+
+            frame_data = interaction.get(
+                str(frame),
+                {},
+            )
+
+            for source_id, neighbors in frame_data.items():
+
+                source_idx = object_to_idx.get(
+                    str(source_id)
+                )
+
+                if source_idx is None:
+                    continue
+
+                for k, neighbor in enumerate(
+                    neighbors[:K]
+                ):
+
+                    interaction_tensor[
+                        t,
+                        source_idx,
+                        k,
+                    ] = torch.tensor(
+                        [
+                            neighbor["distance"],
+                            neighbor["dx"],
+                            neighbor["dy"],
+                            neighbor["relative_vx"],
+                            neighbor["relative_vy"],
+                            neighbor["relative_speed"],
+                            neighbor["closing_speed"],
+                            neighbor["direction_difference"],
+                            neighbor["interaction_strength"],
+                        ],
+                        dtype=torch.float32,
+                    )
+
+                    neighbor_mask[
+                        t,
+                        source_idx,
+                        k,
+                    ] = True
+
+        # ========================================================
+        # Horizon labels
+        # ========================================================
+
+        if target is True:
+
+            for t, frame in enumerate(target_frames):
+
+                delta = accident_frame - frame
+
+                for h, horizon in enumerate(self.horizons):
+
+                    if (
+                        0 < delta <= self.fps * horizon
+                    ):
+                        labels[t, h] = 1.0
+
+        # ========================================================
+        # TAA metadata
+        # ========================================================
+
+        is_test = self.split == "test"
+
+        is_val = self.split in (
+            "val",
+            "test",
+        )
+
+        return {
+            "motion": motion_tensor,
+            "interaction": interaction_tensor,
+            "motion_mask": motion_mask,
+            "neighbor_mask": neighbor_mask,
+            "labels": labels,
+
+            "frames": torch.tensor(
+                target_frames,
+                dtype=torch.long,
+            ),
+
+            "accident_frame": torch.tensor(
+                accident_frame,
+                dtype=torch.long,
+            ),
+
+            "video_id": video_id,
+            "target": bool(target),
+
+            "abnormal_start_frame": int(
+                sample["abnormal_start"]
+            ),
+
+            "dataset": "DADA2000",
+            "frame_dir": video_id,
+            "filename_tmpl": "{:04d}.png",
+            "type": "DADA2000",
+            "start_index": self.start_index,
+
+            "total_frames": int(
+                sample["total_frames"]
+            ),
+
+            "is_val": is_val,
+            "is_test": is_test,
+        }
+
+
+# ================================================================
+# Collate
+# ================================================================
+
+@FUNCTIONS.register_module()
+def mistn_collate_fn(batch):
+
+    return {
+        "inputs": {
+            "motion": torch.stack(
+                [item["motion"] for item in batch]
+            ),
+
+            "interaction": torch.stack(
+                [item["interaction"] for item in batch]
+            ),
+
+            "motion_mask": torch.stack(
+                [item["motion_mask"] for item in batch]
+            ),
+
+            "neighbor_mask": torch.stack(
+                [item["neighbor_mask"] for item in batch]
+            ),
+
+            "labels": torch.stack(
+                [item["labels"] for item in batch]
+            ),
+
+            "frames": torch.stack(
+                [item["frames"] for item in batch]
+            ),
+
+            "accident_frame": torch.stack(
+                [item["accident_frame"] for item in batch]
+            ),
+
+            "video_id": [
+                item["video_id"]
+                for item in batch
+            ],
+
+            "target": [
+                item["target"]
+                for item in batch
+            ],
+
+            "abnormal_start_frame": [
+                item["abnormal_start_frame"]
+                for item in batch
+            ],
+
+            "dataset": [
+                item["dataset"]
+                for item in batch
+            ],
+
+            "frame_dir": [
+                item["frame_dir"]
+                for item in batch
+            ],
+
+            "filename_tmpl": [
+                item["filename_tmpl"]
+                for item in batch
+            ],
+
+            "type": [
+                item["type"]
+                for item in batch
+            ],
+
+            "start_index": [
+                item["start_index"]
+                for item in batch
+            ],
+
+            "total_frames": [
+                item["total_frames"]
+                for item in batch
+            ],
+
+            "is_val": [
+                item["is_val"]
+                for item in batch
+            ],
+
+            "is_test": [
+                item["is_test"]
+                for item in batch
+            ],
+        },
+
+        "data_samples": [
+            {
+                "video_id": item["video_id"],
+                "target": item["target"],
+                "is_val": item["is_val"],
+                "is_test": item["is_test"],
+            }
+            for item in batch
+        ],
+    }
