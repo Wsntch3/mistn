@@ -1,6 +1,3 @@
-%cd /content/RiskProp
-
-%%writefile mi_stn/dataset.py
 import json
 from pathlib import Path
 
